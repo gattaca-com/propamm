@@ -43,6 +43,7 @@ DEFAULT_BINANCE = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDC"
 WETH = to_checksum_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
 USDC = to_checksum_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
 FERMI_SWAPPER = to_checksum_address("0xb1076fe3ab5e28005c7c323bac5ac06a680d452e")
+BEBOP = to_checksum_address("0x160141a205f5ddcf096ba3f48b7ed21eb52c62ea")
 KIPSELI_POOL = to_checksum_address("0x5cdbe59400cc2efdcc2b54acca4a99fe00dd588c")
 
 USDC_DECIMALS = 6
@@ -65,6 +66,15 @@ PAMMS: list[dict] = [
         "oracle":   "0x8051c111cd6978396e4f81cd81d21b1ae8be5a08",
         "selector": "5a837efd",
         "kind":     "kipseli",
+    },
+    {
+        # quote(address tokenIn, address tokenOut, uint256 amountIn) → amountOut.
+        # Same address serves as both quote source and oracle target.
+        "name":     "bopAMM",
+        "quoter":   BEBOP.lower(),
+        "oracle":   BEBOP.lower(),
+        "selector": "b6466384",
+        "kind":     "bopamm",
     },
 ]
 
@@ -176,6 +186,14 @@ def encode_quote_calldata(
             + addr_word(token_out)
             + addr_word(KIPSELI_DEST_PLACEHOLDER)
         )
+    if pamm["kind"] == "bopamm":
+        return (
+            "0x"
+            + pamm["selector"]
+            + addr_word(token_in)
+            + addr_word(token_out)
+            + to_word(amount_in)
+        )
     raise ValueError(f"unknown pamm kind: {pamm['kind']!r}")
 
 
@@ -190,7 +208,7 @@ def decode_quote_result(
             int.from_bytes(raw[0:32], "big", signed=False),
             int.from_bytes(raw[32:64], "big", signed=False),
         )
-    if pamm["kind"] == "kipseli":
+    if pamm["kind"] in ("kipseli", "bopamm"):
         if len(raw) < 32:
             return f"SHORT({len(raw)}b)", 0, 0
         return None, amount_in_requested, int.from_bytes(raw[0:32], "big", signed=False)
