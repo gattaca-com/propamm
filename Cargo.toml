@@ -1,0 +1,33 @@
+[package]
+name = "propamm-taker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Reference taker for propAMM swap bundles via Titan's eth_sendBundle"
+repository = "https://github.com/gattaca-com/propamm"
+readme = "README.md"
+
+[[bin]]
+name = "propamm-taker"
+path = "src/main.rs"
+
+[dependencies]
+alloy-consensus = { version = "1.0", features = ["k256", "serde"] }
+alloy-eips = "1.0"
+alloy-network = "1.0"
+alloy-primitives = { version = "1.0", features = ["k256", "serde"] }
+alloy-provider = "1.0"
+alloy-rpc-types = "1.0"
+alloy-signer-local = "1.0"
+alloy-sol-types = "1.0"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
