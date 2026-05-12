@@ -1,0 +1,15 @@
+[project]
+name = "propamm"
+version = "0.1.0"
+description = "Reference taker + quoter scripts for propAMM swaps via Titan"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.10",
+    "eth-abi>=5.0",
+    "eth-account>=0.13",
+    "eth-utils>=4.0",
+    "web3>=7.0",
+    "websockets>=13.0",
+]
