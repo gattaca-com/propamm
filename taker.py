@@ -19,6 +19,11 @@ One-time setup (wrap ETH and grant ERC20 approvals to the target contract)::
     python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
         --contract kipseli --setup-only
 
+Dual-bundle setup grants approvals to both FermiSwapper and KipseliGuard::
+
+    python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
+        --dual-bundle --setup-only
+
 Single-shot dry-run (no ``--send``) — prints the calldata and tx hash that
 would be submitted but does not POST to Titan::
 
@@ -39,6 +44,15 @@ Same against Fermi::
         --contract fermi --stream --send --skip-setup \\
         --pair weth/usdc --notional-usd 2 \\
         --min-priority-gwei 5 --interval-secs 3
+
+One bundle containing Kipseli + Fermi swaps. Live ``--dual-bundle --send``
+requires ``--stream`` so both swaps are pre-simulated against matching block
+state overrides::
+
+    python taker.py --eth-rpc-url "$ETH_RPC_URL" \
+        --dual-bundle --stream --send --skip-setup --once \
+        --pair weth/usdc --notional-usd 1 \
+        --min-priority-gwei 5
 
 Same against Bebop::
 
@@ -386,24 +400,31 @@ async def send_with_account(w3: AsyncWeb3, account, tx: dict) -> dict:
 
 async def setup(w3: AsyncWeb3, account, args) -> None:
     me = account.address
-    spender = args.contract.address
-    label = args.contract.label
+    spenders = (
+        (
+            (FERMI_SWAPPER, Contract.FERMI.label),
+            (KIPSELI_GUARD, Contract.KIPSELI.label),
+        )
+        if args.dual_bundle
+        else ((args.contract.address, args.contract.label),)
+    )
     weth_target = 100 * 10**18
     stable_target = 100_000 * 10**STABLE_DECIMALS
-    for token, sym, target in (
-        (WETH, "WETH", weth_target),
-        (USDC, "USDC", stable_target),
-        (USDT, "USDT", stable_target),
-    ):
-        allowance = await read_uint256(w3, token, cd_allowance(me, spender))
-        if allowance >= target:
-            print(f"[setup] {sym} already approved")
-            continue
-        print(f"[setup] approving {sym} -> {label}")
-        receipt = await send_with_account(
-            w3, account, {"to": token, "data": cd_approve(spender, target)}
-        )
-        print(f"[setup]   {sym} approve mined block={receipt.get('blockNumber')}")
+    for spender, label in spenders:
+        for token, sym, target in (
+            (WETH, "WETH", weth_target),
+            (USDC, "USDC", stable_target),
+            (USDT, "USDT", stable_target),
+        ):
+            allowance = await read_uint256(w3, token, cd_allowance(me, spender))
+            if allowance >= target:
+                print(f"[setup] {sym} already approved -> {label}")
+                continue
+            print(f"[setup] approving {sym} -> {label}")
+            receipt = await send_with_account(
+                w3, account, {"to": token, "data": cd_approve(spender, target)}
+            )
+            print(f"[setup]   {sym} approve mined block={receipt.get('blockNumber')}")
 
     weth_bal = await read_uint256(w3, WETH, cd_balance_of(me))
     target_wei = int(args.target_weth * 1e18)
@@ -453,22 +474,7 @@ def build_signed_tx(
     return "0x" + raw.hex(), "0x" + keccak(raw).hex()
 
 
-async def trade_once(
-    w3: AsyncWeb3,
-    http: aiohttp.ClientSession,
-    account,
-    args,
-    chain_id: int,
-    iter_: int,
-    state: Optional[StateStream],
-    watcher: Optional[TxMonitor],
-) -> None:
-    me = account.address
-    nonce = await w3.eth.get_transaction_count(me, "pending")
-    max_fee, max_priority = await estimate_eip1559(w3)
-    max_priority = max(max_priority, args.min_priority_gwei * 1_000_000_000)
-    max_fee = max(max_fee, max_priority * 3)
-
+def trade_params(args, iter_: int):
     stable = Stable.USDC if args.pair is Pair.WETH_USDC else Stable.USDT
     direction = (
         Direction.STABLE_TO_WETH if iter_ % 2 == 0 else Direction.WETH_TO_STABLE
@@ -490,8 +496,36 @@ async def trade_once(
     slip_lo = max(10_000 - slip, 0)
     slip_hi = 10_000 + slip
     min_out = expected_out * slip_lo // bps
+    return (
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        min_out,
+        label,
+    )
 
-    if args.contract is Contract.FERMI:
+
+async def build_swap_calldata(
+    w3: AsyncWeb3,
+    contract: Contract,
+    direction: Direction,
+    token_in: str,
+    token_out: str,
+    amount_in: int,
+    min_out: int,
+    stable_units: int,
+    weth_units: int,
+    slip_lo: int,
+    slip_hi: int,
+    recipient: str,
+) -> bytes:
+    bps = 10_000
+    if contract is Contract.FERMI:
         # Fermi's amountSpecified is signed: positive = exact tokenIn, negative
         # = exact tokenOut. Trade is always denominated in stable units, so flip
         # the sign on WETH-input legs to mean "exact stable output".
@@ -501,36 +535,151 @@ async def trade_once(
         else:
             amount_specified = -stable_units
             amount_check = weth_units * slip_hi // bps
-        calldata = cd_fermi_swap(token_in, token_out, amount_specified, amount_check, me)
-    elif args.contract is Contract.BEBOP:
+        return cd_fermi_swap(
+            token_in, token_out, amount_specified, amount_check, recipient
+        )
+    if contract is Contract.BEBOP:
         pending = await w3.eth.get_block("pending")
         expiry = pending["timestamp"] + BEBOP_EXPIRY_SECS
-        calldata = cd_bebop_swap(token_in, token_out, amount_in, min_out, expiry)
-    else:
-        calldata = cd_kipseli_swap(token_in, amount_in, token_out, min_out)
+        return cd_bebop_swap(token_in, token_out, amount_in, min_out, expiry)
+    return cd_kipseli_swap(token_in, amount_in, token_out, min_out)
 
-    if state is not None:
+
+async def next_state_frame(state: StateStream):
+    await state.changed()
+    frame = state.borrow_and_update()
+    while frame is None:
         await state.changed()
         frame = state.borrow_and_update()
-        while frame is None:
-            await state.changed()
-            frame = state.borrow_and_update()
-        block_number, timestamp_secs, state_override = frame
-        call = {
-            "from": me,
-            "to": args.contract.address,
-            "data": "0x" + calldata.hex(),
-        }
-        block_overrides = {
-            "number": hex(block_number),
-            "time": hex(timestamp_secs),
-        }
-        params = [call, "latest", state_override, block_overrides]
-        response = await w3.provider.make_request("eth_call", params)
-        if response.get("error"):
-            print(f"[trade] state-override sim reverts, skipping: {response['error']}")
+    return frame
+
+
+async def state_sim_ok(
+    w3: AsyncWeb3,
+    me: str,
+    to: str,
+    calldata: bytes,
+    frame,
+    prefix: str,
+) -> bool:
+    block_number, timestamp_secs, state_override = frame
+    call = {
+        "from": me,
+        "to": to,
+        "data": "0x" + calldata.hex(),
+    }
+    block_overrides = {
+        "number": hex(block_number),
+        "time": hex(timestamp_secs),
+    }
+    params = [call, "latest", state_override, block_overrides]
+    response = await w3.provider.make_request("eth_call", params)
+    if response.get("error"):
+        print(f"{prefix} state-override sim reverts, skipping: {response['error']}")
+        return False
+    print(f"{prefix} state-override sim ok @ block {block_number}")
+    return True
+
+
+async def dual_preflight_ok(
+    w3: AsyncWeb3,
+    me: str,
+    direction: Direction,
+    token_in: str,
+    stable_units: int,
+    weth_units: int,
+    slip_hi: int,
+    max_fee: int,
+) -> bool:
+    gas_budget = (Contract.KIPSELI.gas_limit + Contract.FERMI.gas_limit) * max_fee
+    eth_balance = await w3.eth.get_balance(me)
+    if eth_balance < gas_budget:
+        print(f"[dual] ETH {eth_balance} < gas budget {gas_budget}, skipping")
+        return False
+    if direction is Direction.STABLE_TO_WETH:
+        stable_balance = await read_uint256(w3, token_in, cd_balance_of(me))
+        needed = stable_units * 2
+        if stable_balance < needed:
+            print(
+                f"[dual] stable balance {stable_balance} < dual input {needed}, skipping"
+            )
+            return False
+    else:
+        weth_balance = await read_uint256(w3, WETH, cd_balance_of(me))
+        fermi_max_input = weth_units * slip_hi // 10_000
+        needed = weth_units + fermi_max_input
+        if weth_balance < needed:
+            print(
+                f"[dual] WETH balance {weth_balance} < dual max input {needed}, skipping"
+            )
+            return False
+    return True
+
+
+async def send_titan_bundle(
+    http: aiohttp.ClientSession, titan_url: str, raw_txs: list, prefix: str
+) -> None:
+    # Titan accepts `blockNumber: 0x0` as "include in any block within validity".
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_sendBundle",
+        "params": [{"txs": raw_txs, "blockNumber": "0x0"}],
+    }
+    async with http.post(titan_url, json=body) as resp:
+        text = await resp.text()
+        print(f"{prefix} titan status={resp.status} body={text}")
+
+
+async def trade_once(
+    w3: AsyncWeb3,
+    http: aiohttp.ClientSession,
+    account,
+    args,
+    chain_id: int,
+    iter_: int,
+    state: Optional[StateStream],
+    watcher: Optional[TxMonitor],
+) -> None:
+    me = account.address
+    nonce = await w3.eth.get_transaction_count(me, "pending")
+    max_fee, max_priority = await estimate_eip1559(w3)
+    max_priority = max(max_priority, args.min_priority_gwei * 1_000_000_000)
+    max_fee = max(max_fee, max_priority * 3)
+
+    (
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        min_out,
+        label,
+    ) = trade_params(args, iter_)
+    calldata = await build_swap_calldata(
+        w3,
+        args.contract,
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        min_out,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        me,
+    )
+
+    if state is not None:
+        frame = await next_state_frame(state)
+        if not await state_sim_ok(
+            w3, me, args.contract.address, calldata, frame, "[trade]"
+        ):
             return
-        print(f"[trade] state-override sim ok @ block {block_number}")
 
     raw_tx, tx_hash = build_signed_tx(
         account,
@@ -548,18 +697,132 @@ async def trade_once(
     )
     if not args.send:
         return
-    # Titan accepts `blockNumber: 0x0` as "include in any block within validity".
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_sendBundle",
-        "params": [{"txs": [raw_tx], "blockNumber": "0x0"}],
-    }
-    async with http.post(args.titan_url, json=body) as resp:
-        text = await resp.text()
-        print(f"[trade] titan status={resp.status} body={text}")
+    await send_titan_bundle(http, args.titan_url, [raw_tx], "[trade]")
     if watcher is not None:
         watcher.track(tx_hash, label, nonce)
+
+
+async def trade_dual_once(
+    w3: AsyncWeb3,
+    http: aiohttp.ClientSession,
+    account,
+    args,
+    chain_id: int,
+    iter_: int,
+    state: Optional[StateStream],
+    watcher: Optional[TxMonitor],
+) -> None:
+    me = account.address
+    nonce = await w3.eth.get_transaction_count(me, "pending")
+    max_fee, max_priority = await estimate_eip1559(w3)
+    max_priority = max(max_priority, args.min_priority_gwei * 1_000_000_000)
+    max_fee = max(max_fee, max_priority * 3)
+
+    (
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        min_out,
+        label,
+    ) = trade_params(args, iter_)
+    kipseli_calldata = await build_swap_calldata(
+        w3,
+        Contract.KIPSELI,
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        min_out,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        me,
+    )
+    fermi_calldata = await build_swap_calldata(
+        w3,
+        Contract.FERMI,
+        direction,
+        token_in,
+        token_out,
+        amount_in,
+        min_out,
+        stable_units,
+        weth_units,
+        slip_lo,
+        slip_hi,
+        me,
+    )
+
+    if state is not None:
+        (
+            block_number,
+            timestamp_secs,
+            fermi_override,
+            kipseli_override,
+        ) = await next_state_frame(state)
+        kipseli_ok = await state_sim_ok(
+            w3,
+            me,
+            Contract.KIPSELI.address,
+            kipseli_calldata,
+            (block_number, timestamp_secs, kipseli_override),
+            "[dual] kipseli",
+        )
+        fermi_ok = await state_sim_ok(
+            w3,
+            me,
+            Contract.FERMI.address,
+            fermi_calldata,
+            (block_number, timestamp_secs, fermi_override),
+            "[dual] fermi",
+        )
+        if not (kipseli_ok and fermi_ok):
+            return
+
+    if args.send and not await dual_preflight_ok(
+        w3, me, direction, token_in, stable_units, weth_units, slip_hi, max_fee
+    ):
+        return
+
+    raw_kipseli, kipseli_tx_hash = build_signed_tx(
+        account,
+        chain_id,
+        nonce,
+        Contract.KIPSELI.gas_limit,
+        max_fee,
+        max_priority,
+        Contract.KIPSELI.address,
+        kipseli_calldata,
+    )
+    raw_fermi, fermi_tx_hash = build_signed_tx(
+        account,
+        chain_id,
+        nonce + 1,
+        Contract.FERMI.gas_limit,
+        max_fee,
+        max_priority,
+        Contract.FERMI.address,
+        fermi_calldata,
+    )
+    print(
+        f"[dual] {label} nonce={nonce}/{nonce + 1} amount_in={amount_in} "
+        f"min_out={min_out} max_fee={max_fee} max_prio={max_priority} "
+        f"kipseli_tx_hash={kipseli_tx_hash} fermi_tx_hash={fermi_tx_hash}"
+    )
+    if not args.send:
+        return
+    await send_titan_bundle(
+        http, args.titan_url, [raw_kipseli, raw_fermi], "[dual]"
+    )
+    if watcher is not None:
+        watcher.track(kipseli_tx_hash, f"{label} Kipseli", nonce)
+        watcher.track(fermi_tx_hash, f"{label} Fermi", nonce + 1)
 
 
 async def run_state_stream(
@@ -591,8 +854,66 @@ async def run_state_stream(
                             and isinstance(val, dict)
                             and "stateOverride" in val
                         ):
-                            state.set((block_number, timestamp_secs, val["stateOverride"]))
+                            state.set(
+                                (block_number, timestamp_secs, val["stateOverride"])
+                            )
                             break
+        except Exception as e:
+            print(f"[stream] disconnected: {e}")
+        await asyncio.sleep(5)
+
+
+async def run_dual_state_stream(region: StreamRegion, state: StateStream) -> None:
+    url = region.ws_url
+    fermi_lc = FERMI_SWAPPER.lower()
+    kipseli_lc = KIPSELI_POOL.lower()
+    by_block = {}
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                print(f"[stream] connected: {url}")
+                async for msg in ws:
+                    if isinstance(msg, bytes):
+                        continue
+                    try:
+                        v = json.loads(msg)
+                    except ValueError:
+                        continue
+                    if not isinstance(v, dict):
+                        continue
+                    block_number = v.get("blockNumber")
+                    if not isinstance(block_number, int):
+                        continue
+                    ts = v.get("timestamp")
+                    timestamp_secs = (
+                        (ts // 1_000_000_000) if isinstance(ts, int) else 0
+                    )
+                    block_state = by_block.setdefault(
+                        block_number, {"timestamp_secs": timestamp_secs}
+                    )
+                    for k, val in v.items():
+                        if not isinstance(k, str) or not isinstance(val, dict):
+                            continue
+                        state_override = val.get("stateOverride")
+                        if not isinstance(state_override, dict):
+                            continue
+                        k_lc = k.lower()
+                        if k_lc == fermi_lc:
+                            block_state["fermi"] = state_override
+                        elif k_lc == kipseli_lc:
+                            block_state["kipseli"] = state_override
+                    if "fermi" in block_state and "kipseli" in block_state:
+                        state.set(
+                            (
+                                block_number,
+                                block_state["timestamp_secs"],
+                                block_state["fermi"],
+                                block_state["kipseli"],
+                            )
+                        )
+                    for old_block in list(by_block):
+                        if old_block < block_number - 2:
+                            del by_block[old_block]
         except Exception as e:
             print(f"[stream] disconnected: {e}")
         await asyncio.sleep(5)
@@ -620,6 +941,11 @@ def parse_args() -> argparse.Namespace:
         type=_enum_arg(Contract, "contract"),
         default=Contract.FERMI,
         help="Target pAMM contract (fermi|bebop|kipseli).",
+    )
+    p.add_argument(
+        "--dual-bundle",
+        action="store_true",
+        help="Submit one Titan bundle containing both Kipseli and Fermi swaps.",
     )
     p.add_argument(
         "--notional-usd", type=float, default=1.0,
@@ -690,6 +1016,12 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.setup_only and args.skip_setup:
         p.error("--setup-only conflicts with --skip-setup")
+    if args.dual_bundle and args.contract is Contract.BEBOP:
+        p.error(
+            "--dual-bundle submits Kipseli + Fermi; Bebop is not part of this mode"
+        )
+    if args.dual_bundle and args.send and not args.stream:
+        p.error("--dual-bundle --send requires --stream")
     return args
 
 
@@ -715,7 +1047,8 @@ async def amain() -> None:
         sys.exit(f"failed to fetch ETH/USDC mid from Binance: {e}")
     asyncio.create_task(refresh_binance_mid(args))
 
-    print(f"signer={me} chain_id={chain_id} contract={args.contract.label}")
+    label = "Kipseli+Fermi" if args.dual_bundle else args.contract.label
+    print(f"signer={me} chain_id={chain_id} contract={label}")
     await print_balances(w3, me)
 
     if not args.skip_setup:
@@ -726,11 +1059,14 @@ async def amain() -> None:
 
     state: Optional[StateStream] = None
     if args.stream:
-        key = args.contract.stream_key
-        if key is None:
-            raise RuntimeError(f"--stream not supported for {args.contract.label}")
         state = StateStream()
-        asyncio.create_task(run_state_stream(args.stream_region, key, state))
+        if args.dual_bundle:
+            asyncio.create_task(run_dual_state_stream(args.stream_region, state))
+        else:
+            key = args.contract.stream_key
+            if key is None:
+                raise RuntimeError(f"--stream not supported for {args.contract.label}")
+            asyncio.create_task(run_state_stream(args.stream_region, key, state))
 
     watcher: Optional[TxMonitor] = None
     if args.send:
@@ -742,7 +1078,14 @@ async def amain() -> None:
         iter_ = 0
         while True:
             try:
-                await trade_once(w3, http, account, args, chain_id, iter_, state, watcher)
+                if args.dual_bundle:
+                    await trade_dual_once(
+                        w3, http, account, args, chain_id, iter_, state, watcher
+                    )
+                else:
+                    await trade_once(
+                        w3, http, account, args, chain_id, iter_, state, watcher
+                    )
             except Exception as e:
                 print(f"[iter {iter_}] error: {e}")
             iter_ += 1

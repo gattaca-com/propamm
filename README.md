@@ -8,7 +8,7 @@ Three scripts, same protocol family:
 | Script | What it does |
 |---|---|
 | `quoter.py` | Subscribe to Titan's pAMM state-diff WebSocket and run pre-trade quote sims against the current state override. |
-| `taker.py` / `src/main.rs` | Wrap ETH, set approvals, sign + submit swap bundles to Titan. Python and Rust ports are byte-equivalent. |
+| `taker.py` / `src/main.rs` | Wrap ETH, set approvals, sign + submit swap bundles to Titan. The Python taker also supports dual Kipseli+Fermi bundles. |
 | `contracts/KipseliGuard.sol` | Optional permissionless slippage-checking wrapper around the Kipseli pool. |
 
 All three scripts accept `--eth-rpc-url <URL>`. You need a mainnet RPC that
@@ -17,7 +17,9 @@ Geth/Reth). Public free RPCs typically don't.
 
 `taker.py` and the Rust taker additionally need a mainnet-funded signer EOA —
 its private key is read from the `PROP_AMM_TAKER_PRIVATE_KEY` environment
-variable (hex, with or without `0x`). The quoter does not need it.
+variable (hex, with or without `0x`). The quoter does not need it. Never commit
+real private keys, RPC API keys, auth tokens, or funded addresses' secret
+material; examples in this repository use placeholders only.
 
 ```sh
 export PROP_AMM_TAKER_PRIVATE_KEY=0x...
@@ -51,6 +53,13 @@ One-time setup (wrap ETH, grant ERC20 approvals to the target contract):
 python taker.py --eth-rpc-url <your-rpc-url> --contract fermi --setup-only
 ```
 
+For dual-bundle mode, setup grants approvals to both FermiSwapper and
+KipseliGuard:
+
+```sh
+python taker.py --eth-rpc-url <your-rpc-url> --dual-bundle --setup-only
+```
+
 Dry-run a single trade (no `--send`):
 
 ```sh
@@ -68,6 +77,17 @@ python taker.py --eth-rpc-url <your-rpc-url> \
     --min-priority-gwei 5 --interval-secs 3
 ```
 
+Submit one Titan bundle containing both Kipseli and Fermi swaps. Live
+`--dual-bundle --send` requires `--stream` so both swaps are pre-simulated
+against Fermi and Kipseli state overrides from the same block context:
+
+```sh
+python taker.py --eth-rpc-url <your-rpc-url> \
+    --dual-bundle --stream --send --skip-setup --once \
+    --pair weth/usdc --notional-usd 1 \
+    --min-priority-gwei 5
+```
+
 Same against Bebop:
 
 ```sh
@@ -77,8 +97,8 @@ python taker.py --eth-rpc-url <your-rpc-url> \
     --min-priority-gwei 5 --interval-secs 3
 ```
 
-Flags: `--contract {fermi|bebop|kipseli}` `--pair {weth/usdc|weth/usdt}`
-`--notional-usd N` `--slippage-bps N`
+Flags: `--contract {fermi|bebop|kipseli}` `--dual-bundle`
+`--pair {weth/usdc|weth/usdt}` `--notional-usd N` `--slippage-bps N`
 `--min-priority-gwei N` `--interval-secs N` `--reserve-eth F` `--target-weth F`
 `--send` `--once` `--setup-only` `--skip-setup` `--stream`
 `--stream-region {eu|ap|us}` `--titan-url URL`. The ETH/USDC mid used to size
@@ -89,7 +109,8 @@ tx the script prints a `[dropped]` line and stops polling that hash.
 
 ## `src/main.rs` (Rust taker)
 
-Same flags, same behavior:
+The Rust taker matches the single-contract Python behavior. The `--dual-bundle`
+mode is currently Python-only:
 
 ```sh
 cargo run --release -- --eth-rpc-url <your-rpc-url> \
@@ -103,7 +124,10 @@ cargo run --release -- --eth-rpc-url <your-rpc-url> \
 `--stream` subscribes to Titan's pAMM state-diff
 WebSocket at `wss://{eu,ap,us}.rpc.titanbuilder.xyz/ws/pamm_quote_stream`,
 pre-simulates each swap via `eth_call` with the stream's `stateOverride` +
-block overrides, and skips submission when the sim reverts.
+block overrides, and skips submission when the sim reverts. With
+`--dual-bundle`, the stream waits for Fermi and Kipseli state overrides from the
+same block context, pre-simulates both, checks aggregate token balance and gas
+budget, and posts them as one Titan bundle.
 
 ## Targets
 
