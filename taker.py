@@ -581,17 +581,20 @@ async def run_state_stream(
                     if not isinstance(v, dict):
                         continue
                     block_number = v.get("blockNumber")
+                    if block_number is None:
+                        block_number = v.get("block_number")
                     if not isinstance(block_number, int):
                         continue
                     ts = v.get("timestamp")
                     timestamp_secs = (ts // 1_000_000_000) if isinstance(ts, int) else 0
                     for k, val in v.items():
-                        if (
-                            k.lower() == contract_lc
-                            and isinstance(val, dict)
-                            and "stateOverride" in val
-                        ):
-                            state.set((block_number, timestamp_secs, val["stateOverride"]))
+                        if k.lower() != contract_lc or not isinstance(val, dict):
+                            continue
+                        state_override = val.get("stateOverride")
+                        if state_override is None:
+                            state_override = val.get("state_override")
+                        if state_override is not None:
+                            state.set((block_number, timestamp_secs, state_override))
                             break
         except Exception as e:
             print(f"[stream] disconnected: {e}")
