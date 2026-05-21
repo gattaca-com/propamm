@@ -92,6 +92,10 @@ const KIPSELI_POOL: Address = address!("5cdbe59400cc2efdcc2b54acca4a99fe00dd588c
 const STABLE_DECIMALS: u32 = 6;
 const BEBOP_EXPIRY_SECS: u64 = 120;
 
+type StateStreamFrame = (u64, u64, Value);
+type StateStreamRx = watch::Receiver<Option<StateStreamFrame>>;
+type StateStreamTx = watch::Sender<Option<StateStreamFrame>>;
+
 sol! {
     interface IERC20 {
         function balanceOf(address account) external view returns (uint256);
@@ -317,7 +321,10 @@ async fn main() -> Result<()> {
         println!("warning: chain_id={chain_id}, expected 1 (mainnet)");
     }
 
-    println!("signer={me} chain_id={chain_id} contract={}", args.contract.label());
+    println!(
+        "signer={me} chain_id={chain_id} contract={}",
+        args.contract.label()
+    );
     print_balances(&provider, me).await?;
 
     if !args.skip_setup {
@@ -328,9 +335,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
     let interval = Duration::from_secs(args.interval_secs);
-    let mut stream_rx: Option<watch::Receiver<Option<(u64, u64, Value)>>> = if args.stream {
+    let mut stream_rx: Option<StateStreamRx> = if args.stream {
         let key = args
             .contract
             .stream_key()
@@ -347,8 +356,11 @@ async fn main() -> Result<()> {
             Pair::WethUsdc => Stable::Usdc,
             Pair::WethUsdt => Stable::Usdt,
         };
-        let dir =
-            if iter.is_multiple_of(2) { Direction::StableToWeth } else { Direction::WethToStable };
+        let dir = if iter.is_multiple_of(2) {
+            Direction::StableToWeth
+        } else {
+            Direction::WethToStable
+        };
         if let Err(e) = trade_once(
             &provider,
             &http,
@@ -387,7 +399,9 @@ async fn read_view<P: Provider, C: SolCall>(
     to: Address,
     call: C,
 ) -> Result<C::Return> {
-    let req = TransactionRequest::default().with_to(to).with_input(call.abi_encode());
+    let req = TransactionRequest::default()
+        .with_to(to)
+        .with_input(call.abi_encode());
     let bytes = provider.call(req).await?;
     Ok(C::abi_decode_returns(&bytes)?)
 }
@@ -397,20 +411,35 @@ async fn setup<P: Provider>(provider: &P, me: Address, args: &Cli) -> Result<()>
     let label = args.contract.label();
     let weth_target = U256::from(100u128) * U256::from(10u128.pow(18));
     let stable_target = U256::from(100_000u128) * U256::from(10u128.pow(STABLE_DECIMALS));
-    for (token, sym, target) in
-        [(WETH, "WETH", weth_target), (USDC, "USDC", stable_target), (USDT, "USDT", stable_target)]
-    {
-        let allowance =
-            read_view(provider, token, IERC20::allowanceCall { owner: me, spender }).await?;
+    for (token, sym, target) in [
+        (WETH, "WETH", weth_target),
+        (USDC, "USDC", stable_target),
+        (USDT, "USDT", stable_target),
+    ] {
+        let allowance = read_view(
+            provider,
+            token,
+            IERC20::allowanceCall { owner: me, spender },
+        )
+        .await?;
         if allowance >= target {
             println!("[setup] {sym} already approved");
             continue;
         }
         println!("[setup] approving {sym} -> {label}");
-        let calldata = IERC20::approveCall { spender, value: target }.abi_encode();
-        let req = TransactionRequest::default().with_to(token).with_input(calldata);
+        let calldata = IERC20::approveCall {
+            spender,
+            value: target,
+        }
+        .abi_encode();
+        let req = TransactionRequest::default()
+            .with_to(token)
+            .with_input(calldata);
         let receipt = provider.send_transaction(req).await?.get_receipt().await?;
-        println!("[setup]   {sym} approve mined block={:?}", receipt.block_number);
+        println!(
+            "[setup]   {sym} approve mined block={:?}",
+            receipt.block_number
+        );
     }
 
     let weth_bal = read_view(provider, WETH, IERC20::balanceOfCall { account: me }).await?;
@@ -450,22 +479,32 @@ async fn trade_once<P: Provider>(
     me: Address,
     stable: Stable,
     dir: Direction,
-    stream_rx: Option<&mut watch::Receiver<Option<(u64, u64, Value)>>>,
+    stream_rx: Option<&mut StateStreamRx>,
 ) -> Result<()> {
     let nonce = provider.get_transaction_count(me).pending().await?;
     let fees = provider.estimate_eip1559_fees().await?;
-    let max_priority = fees.max_priority_fee_per_gas.max(args.min_priority_gwei * 1_000_000_000);
+    let max_priority = fees
+        .max_priority_fee_per_gas
+        .max(args.min_priority_gwei * 1_000_000_000);
     let max_fee = fees.max_fee_per_gas.max(max_priority * 3);
 
     let stable_units = usd_to_units(args.notional_usd, STABLE_DECIMALS);
     let weth_units = usd_to_units(args.notional_usd, 18) / U256::from(args.eth_price_usd);
     let (token_in, token_out, amount_in, expected_out, label) = match dir {
-        Direction::StableToWeth => {
-            (stable.addr(), WETH, stable_units, weth_units, format!("{}->WETH", stable.sym()))
-        }
-        Direction::WethToStable => {
-            (WETH, stable.addr(), weth_units, stable_units, format!("WETH->{}", stable.sym()))
-        }
+        Direction::StableToWeth => (
+            stable.addr(),
+            WETH,
+            stable_units,
+            weth_units,
+            format!("{}->WETH", stable.sym()),
+        ),
+        Direction::WethToStable => (
+            WETH,
+            stable.addr(),
+            weth_units,
+            stable_units,
+            format!("WETH->{}", stable.sym()),
+        ),
     };
     let bps = U256::from(10_000);
     let slip = args.slippage_bps as u64;
@@ -493,8 +532,10 @@ async fn trade_once<P: Provider>(
             .abi_encode()
         }
         Contract::Bebop => {
-            let pending =
-                provider.get_block(BlockId::pending()).await?.context("no pending block")?;
+            let pending = provider
+                .get_block(BlockId::pending())
+                .await?
+                .context("no pending block")?;
             let expiry = U256::from(pending.header.timestamp + BEBOP_EXPIRY_SECS);
             IBebop::swapCall {
                 tokenIn: token_in,
@@ -531,7 +572,10 @@ async fn trade_once<P: Provider>(
             "time": format!("0x{timestamp_secs:x}"),
         });
         let params = json!([call, "latest", state_override, block_overrides]);
-        match provider.raw_request::<_, Bytes>("eth_call".into(), params).await {
+        match provider
+            .raw_request::<_, Bytes>("eth_call".into(), params)
+            .await
+        {
             Ok(_) => println!("[trade] state-override sim ok @ block {block_number}"),
             Err(e) => {
                 println!("[trade] state-override sim reverts, skipping: {e}");
@@ -565,7 +609,11 @@ async fn trade_once<P: Provider>(
         "params": [{ "txs": [raw_tx], "blockNumber": "0x0" }],
     });
     let resp = http.post(titan_url).json(&body).send().await?;
-    println!("[trade] titan status={} body={}", resp.status(), resp.text().await?);
+    println!(
+        "[trade] titan status={} body={}",
+        resp.status(),
+        resp.text().await?
+    );
     Ok(())
 }
 
@@ -597,11 +645,7 @@ fn build_signed_tx(
     Ok((format!("0x{}", hex::encode(&raw)), tx_hash))
 }
 
-async fn run_state_stream(
-    region: StreamRegion,
-    contract: Address,
-    tx: watch::Sender<Option<(u64, u64, Value)>>,
-) {
+async fn run_state_stream(region: StreamRegion, contract: Address, tx: StateStreamTx) {
     let url = region.ws_url();
     let contract_lc = format!("{contract:#x}").to_lowercase();
     loop {
@@ -611,9 +655,15 @@ async fn run_state_stream(
             let (_, mut reader) = ws.split();
             while let Some(msg) = reader.next().await {
                 let Message::Text(text) = msg? else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
                 let Some(obj) = v.as_object() else { continue };
-                let Some(block_number) = obj.get("blockNumber").and_then(|b| b.as_u64()) else {
+                let Some(block_number) = obj
+                    .get("blockNumber")
+                    .or_else(|| obj.get("block_number"))
+                    .and_then(|b| b.as_u64())
+                else {
                     continue;
                 };
                 let timestamp_secs = obj
@@ -621,8 +671,11 @@ async fn run_state_stream(
                     .and_then(|t| t.as_u64())
                     .map(|ns| ns / 1_000_000_000)
                     .unwrap_or(0);
-                if let Some(entry) = obj.iter().find(|(k, _)| k.to_lowercase() == contract_lc) &&
-                    let Some(so) = entry.1.get("stateOverride")
+                if let Some(entry) = obj.iter().find(|(k, _)| k.to_lowercase() == contract_lc)
+                    && let Some(so) = entry
+                        .1
+                        .get("stateOverride")
+                        .or_else(|| entry.1.get("state_override"))
                 {
                     let _ = tx.send(Some((block_number, timestamp_secs, so.clone())));
                 }
