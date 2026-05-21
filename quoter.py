@@ -4,14 +4,14 @@
 For each frame, filters the stateDiff to addresses with real storage overrides,
 identifies which configured pAMM had its quote contract touched, and runs two
 ``eth_call`` quote simulations (BUY: USDC->WETH, SELL: WETH->USDC) using the
-filtered state override.
+filtered state override and frame block number.
 
 A reference ETHUSDC mid is fetched once from Binance at startup to size the
 SELL leg; the script is otherwise self-contained — no DB, no polling per frame.
 
 ## Examples
 
-The mainnet RPC must support ``eth_call`` with state overrides::
+The mainnet RPC must support ``eth_call`` with state and block overrides::
 
     export ETH_RPC_URL=https://eth-mainnet.example/<key>
 
@@ -225,6 +225,7 @@ def call_quote(
     in_decimals: int,
     out_decimals: int,
     overrides: dict | None,
+    block_number: int | None = None,
 ) -> tuple[str, float | None]:
     data = encode_quote_calldata(
         pamm, token_in=token_in, token_out=token_out, amount_in=amount_in
@@ -239,6 +240,8 @@ def call_quote(
         overrides[token_lc] = {**inner, "stateDiff": state_diff}
     if overrides:
         params.append(overrides)
+        if block_number is not None:
+            params.append({"number": hex(block_number)})
 
     r = jsonrpc(rpc_url, "eth_call", params)
     if "error" in r:
@@ -338,6 +341,9 @@ async def listen(
             continue
 
         by_quoter = overrides_by_quoter(frame)
+        block_number = frame.get("block_number")
+        if block_number is None:
+            block_number = frame.get("blockNumber")
 
         touched: list[tuple[dict, int, dict]] = []
         for pamm in PAMMS:
@@ -362,6 +368,7 @@ async def listen(
                 amount_in=amount_in_buy,
                 in_decimals=USDC_DECIMALS, out_decimals=WETH_DECIMALS,
                 overrides=overrides,
+                block_number=block_number,
             )
             s_sell, p_sell = call_quote(
                 rpc_url, pamm,
@@ -369,6 +376,7 @@ async def listen(
                 amount_in=amount_in_sell,
                 in_decimals=WETH_DECIMALS, out_decimals=USDC_DECIMALS,
                 overrides=overrides,
+                block_number=block_number,
             )
 
             bid_str = f"{p_sell:8.2f}" if p_sell is not None else f"{s_sell:>8s}"
@@ -390,7 +398,7 @@ async def listen(
 def main() -> None:
     p = argparse.ArgumentParser(description="pAMM quote simulator")
     p.add_argument("--eth-rpc-url", required=True,
-                   help="Mainnet RPC URL for eth_call quote sims (must support state overrides)")
+                   help="Mainnet RPC URL for eth_call quote sims (must support state + block overrides)")
     p.add_argument("--ws", default=DEFAULT_WS,
                    help=f"pAMM state-diff WS URL (default: {DEFAULT_WS})")
     p.add_argument("--binance", default=DEFAULT_BINANCE,
