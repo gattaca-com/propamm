@@ -71,7 +71,8 @@ WETH = to_checksum_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
 USDC = to_checksum_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
 USDT = to_checksum_address("0xdac17f958d2ee523a2206206994597c13d831ec7")
 FERMI_SWAPPER = to_checksum_address("0xb1076fe3ab5e28005c7c323bac5ac06a680d452e")
-BEBOP = to_checksum_address("0x160141a205f5ddcf096ba3f48b7ed21eb52c62ea")
+BEBOP = to_checksum_address("0xbc60639345dfa607d73b74e88c2d54d8b8ad7cc3")
+BEBOP_SWAPPER = to_checksum_address("0xdb13ad0fcd134e9c48f2fdaea8f6751a0f5349ca")
 # Optional permissionless slippage-checking wrapper around the Kipseli pool;
 # callers may bypass it and call KIPSELI_POOL directly.
 KIPSELI_GUARD = to_checksum_address("0x9a7a5dccc7851c0f141d07c4d608a29b3830548b")
@@ -79,6 +80,9 @@ KIPSELI_POOL = to_checksum_address("0x5cdbe59400cc2efdcc2b54acca4a99fe00dd588c")
 
 STABLE_DECIMALS = 6
 BEBOP_EXPIRY_SECS = 120
+
+BEACON_GENESIS_TS = 1606824023
+SECONDS_PER_SLOT = 12
 
 
 def _selector(sig: str) -> bytes:
@@ -92,7 +96,7 @@ SEL_DEPOSIT = _selector("deposit()")
 SEL_FERMI_SWAP = _selector(
     "fermiSwapWithAllowances(address,address,int256,uint256,address)"
 )
-SEL_BEBOP_SWAP = _selector("swap(address,address,uint256,uint256,uint256)")
+SEL_BEBOP_SWAP = _selector("swap(address,address,uint256,uint256,uint256,address)")
 SEL_KIPSELI_SWAP = _selector("swap(address,uint256,address,uint256)")
 
 
@@ -113,7 +117,7 @@ class Contract(str, Enum):
     def address(self) -> str:
         return {
             Contract.FERMI: FERMI_SWAPPER,
-            Contract.BEBOP: BEBOP,
+            Contract.BEBOP: BEBOP_SWAPPER,
             Contract.KIPSELI: KIPSELI_GUARD,
         }[self]
 
@@ -315,12 +319,13 @@ def cd_fermi_swap(
 
 
 def cd_bebop_swap(
-    token_in: str, token_out: str, amount_in: int, min_amount_out: int, expiry: int
+    token_in: str, token_out: str, amount_in: int, min_amount_out: int,
+    expiry: int, recipient: str
 ) -> bytes:
     return encode_call(
         SEL_BEBOP_SWAP,
-        ["address", "address", "uint256", "uint256", "uint256"],
-        [token_in, token_out, amount_in, min_amount_out, expiry],
+        ["address", "address", "uint256", "uint256", "uint256", "address"],
+        [token_in, token_out, amount_in, min_amount_out, expiry, recipient],
     )
 
 
@@ -505,7 +510,7 @@ async def trade_once(
     elif args.contract is Contract.BEBOP:
         pending = await w3.eth.get_block("pending")
         expiry = pending["timestamp"] + BEBOP_EXPIRY_SECS
-        calldata = cd_bebop_swap(token_in, token_out, amount_in, min_out, expiry)
+        calldata = cd_bebop_swap(token_in, token_out, amount_in, min_out, expiry, me)
     else:
         calldata = cd_kipseli_swap(token_in, amount_in, token_out, min_out)
 
@@ -585,8 +590,13 @@ async def run_state_stream(
                         block_number = v.get("block_number")
                     if not isinstance(block_number, int):
                         continue
-                    ts = v.get("timestamp")
-                    timestamp_secs = (ts // 1_000_000_000) if isinstance(ts, int) else 0
+                    slot = v.get("slot")
+                    if isinstance(slot, int):
+                        timestamp_secs = BEACON_GENESIS_TS + slot * SECONDS_PER_SLOT
+                    else:
+                        ts = v.get("timestamp")
+                        timestamp_secs = (ts // 1_000_000_000) if isinstance(ts, int) else 0
+                    matched: Optional[dict] = None
                     for k, val in v.items():
                         if k.lower() != contract_lc or not isinstance(val, dict):
                             continue
@@ -594,8 +604,10 @@ async def run_state_stream(
                         if state_override is None:
                             state_override = val.get("state_override")
                         if state_override is not None:
-                            state.set((block_number, timestamp_secs, state_override))
+                            matched = state_override
                             break
+                    if matched is not None:
+                        state.set((block_number, timestamp_secs, matched))
         except Exception as e:
             print(f"[stream] disconnected: {e}")
         await asyncio.sleep(5)
