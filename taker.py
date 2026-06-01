@@ -46,6 +46,13 @@ Same against Bebop::
         --contract bebop --stream --send --skip-setup \\
         --pair weth/usdc --notional-usd 2 \\
         --min-priority-gwei 5 --interval-secs 3
+
+Stable/stable USDC/USDT swaps against Fermi (alternates direction each iter)::
+
+    python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
+        --contract fermi --stream --send --skip-setup \\
+        --pair usdc/usdt --notional-usd 2 \\
+        --min-priority-gwei 5 --interval-secs 3
 """
 
 import argparse
@@ -137,6 +144,7 @@ class Contract(str, Enum):
 class Pair(str, Enum):
     WETH_USDC = "weth/usdc"
     WETH_USDT = "weth/usdt"
+    USDC_USDT = "usdc/usdt"
 
 
 class Stable(str, Enum):
@@ -474,21 +482,31 @@ async def trade_once(
     max_priority = max(max_priority, args.min_priority_gwei * 1_000_000_000)
     max_fee = max(max_fee, max_priority * 3)
 
-    stable = Stable.USDC if args.pair is Pair.WETH_USDC else Stable.USDT
-    direction = (
-        Direction.STABLE_TO_WETH if iter_ % 2 == 0 else Direction.WETH_TO_STABLE
-    )
-
-    stable_units = usd_to_units(args.notional_usd, STABLE_DECIMALS)
-    weth_units = int(usd_to_units(args.notional_usd, 18) / args.eth_price_usd)
-    if direction is Direction.STABLE_TO_WETH:
-        token_in, token_out = stable.addr, WETH
-        amount_in, expected_out = stable_units, weth_units
-        label = f"{stable.sym}->WETH"
+    stable_pair = args.pair is Pair.USDC_USDT
+    if stable_pair:
+        # USDC/USDT: both 6-decimal stables priced ~1:1, so notional maps
+        # straight to units on both legs. Alternate which stable is sold.
+        src, dst = (Stable.USDC, Stable.USDT) if iter_ % 2 == 0 else (Stable.USDT, Stable.USDC)
+        units = usd_to_units(args.notional_usd, STABLE_DECIMALS)
+        token_in, token_out = src.addr, dst.addr
+        amount_in, expected_out = units, units
+        label = f"{src.sym}->{dst.sym}"
     else:
-        token_in, token_out = WETH, stable.addr
-        amount_in, expected_out = weth_units, stable_units
-        label = f"WETH->{stable.sym}"
+        stable = Stable.USDC if args.pair is Pair.WETH_USDC else Stable.USDT
+        direction = (
+            Direction.STABLE_TO_WETH if iter_ % 2 == 0 else Direction.WETH_TO_STABLE
+        )
+
+        stable_units = usd_to_units(args.notional_usd, STABLE_DECIMALS)
+        weth_units = int(usd_to_units(args.notional_usd, 18) / args.eth_price_usd)
+        if direction is Direction.STABLE_TO_WETH:
+            token_in, token_out = stable.addr, WETH
+            amount_in, expected_out = stable_units, weth_units
+            label = f"{stable.sym}->WETH"
+        else:
+            token_in, token_out = WETH, stable.addr
+            amount_in, expected_out = weth_units, stable_units
+            label = f"WETH->{stable.sym}"
 
     bps = 10_000
     slip = args.slippage_bps
@@ -498,9 +516,13 @@ async def trade_once(
 
     if args.contract is Contract.FERMI:
         # Fermi's amountSpecified is signed: positive = exact tokenIn, negative
-        # = exact tokenOut. Trade is always denominated in stable units, so flip
-        # the sign on WETH-input legs to mean "exact stable output".
-        if direction is Direction.STABLE_TO_WETH:
+        # = exact tokenOut. For WETH/stable the trade is denominated in stable
+        # units, so flip the sign on WETH-input legs to mean "exact stable
+        # output". For the stable/stable pair we just do plain exact-input.
+        if stable_pair:
+            amount_specified = amount_in
+            amount_check = expected_out * slip_lo // bps
+        elif direction is Direction.STABLE_TO_WETH:
             amount_specified = stable_units
             amount_check = weth_units * slip_lo // bps
         else:
@@ -644,7 +666,7 @@ def parse_args() -> argparse.Namespace:
         "--pair",
         type=_enum_arg(Pair, "pair"),
         default=Pair.WETH_USDC,
-        help="Trading pair: weth/usdc or weth/usdt.",
+        help="Trading pair: weth/usdc, weth/usdt, or usdc/usdt.",
     )
     p.add_argument(
         "--slippage-bps", type=int, default=50,
