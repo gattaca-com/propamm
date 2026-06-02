@@ -1,4 +1,4 @@
-//! pAMM taker — wraps ETH, sets approvals, sends a swap bundle to Titan.
+//! pAMM taker — wraps ETH, sets approvals, sends swaps to Titan.
 //!
 //! Targets FermiSwapper (default), Bebop, or KipseliGuard.
 //!
@@ -37,6 +37,9 @@
 //!       --pair weth/usdc --notional-usd 2 \
 //!       --min-priority-gwei 5 --interval-secs 3
 //! ```
+//!
+//! Add `--send-mode raw-transaction` to submit the signed transaction through
+//! Titan's `eth_sendRawTransaction` instead of `eth_sendBundle`.
 //!
 //! Same against Fermi:
 //! ```text
@@ -229,8 +232,23 @@ impl StreamRegion {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SendMode {
+    Bundle,
+    RawTransaction,
+}
+
+impl SendMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bundle => "bundle",
+            Self::RawTransaction => "raw-transaction",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
-#[command(about = "pAMM taker: wrap ETH, approve, and send a swap bundle to Titan.")]
+#[command(about = "pAMM taker: wrap ETH, approve, and send swaps to Titan.")]
 struct Cli {
     /// Target pAMM contract.
     #[arg(long, value_enum, default_value_t = Contract::Fermi)]
@@ -264,9 +282,13 @@ struct Cli {
     #[arg(long, default_value_t = 0.02)]
     target_weth: f64,
 
-    /// POST bundles to Titan. Without this, runs as a dry-run.
+    /// POST signed swaps to Titan. Without this, runs as a dry-run.
     #[arg(long)]
     send: bool,
+
+    /// Titan submission method when --send is set.
+    #[arg(long, value_enum, default_value_t = SendMode::Bundle)]
+    send_mode: SendMode,
 
     /// Run one iteration then exit.
     #[arg(long)]
@@ -296,7 +318,7 @@ struct Cli {
     #[arg(long)]
     eth_rpc_url: String,
 
-    /// Titan bundle RPC URL for `eth_sendBundle`.
+    /// Titan RPC URL for bundle or raw transaction submission.
     #[arg(long, default_value = TITAN_RPC_DEFAULT)]
     titan_url: String,
 }
@@ -428,6 +450,10 @@ async fn main() -> Result<()> {
         if args.setup_only {
             return Ok(());
         }
+    }
+
+    if !args.send {
+        println!("[dry-run] --send not set; signed swaps will not be submitted to Titan");
     }
 
     let http = reqwest::Client::builder()
@@ -715,16 +741,27 @@ async fn trade_once<P: Provider>(
     if !args.send {
         return Ok(());
     }
-    // Titan accepts `blockNumber: 0x0` as "include in any block within validity".
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_sendBundle",
-        "params": [{ "txs": [raw_tx], "blockNumber": "0x0" }],
-    });
+    let body = match args.send_mode {
+        SendMode::Bundle => {
+            // Titan accepts `blockNumber: 0x0` as "include in any block within validity".
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_sendBundle",
+                "params": [{ "txs": [raw_tx], "blockNumber": "0x0" }],
+            })
+        }
+        SendMode::RawTransaction => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [raw_tx],
+        }),
+    };
     let resp = http.post(titan_url).json(&body).send().await?;
     println!(
-        "[trade] titan status={} body={}",
+        "[trade] titan mode={} status={} body={}",
+        args.send_mode.label(),
         resp.status(),
         resp.text().await?
     );

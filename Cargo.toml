@@ -3,7 +3,7 @@ name = "propamm-taker"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Reference taker for propAMM swap bundles via Titan's eth_sendBundle"
+description = "Reference taker for propAMM swaps via Titan"
 repository = "https://github.com/gattaca-com/propamm"
 readme = "README.md"
 

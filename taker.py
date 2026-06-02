@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pAMM taker — wraps ETH, sets approvals, sends a swap bundle to Titan.
+"""pAMM taker — wraps ETH, sets approvals, sends swaps to Titan.
 
 Targets FermiSwapper (default), Bebop, or KipseliGuard.
 
@@ -32,6 +32,9 @@ Continuous stream-gated $2 WETH/USDC swaps against Kipseli via Titan::
         --contract kipseli --stream --send --skip-setup \\
         --pair weth/usdc --notional-usd 2 \\
         --min-priority-gwei 5 --interval-secs 3
+
+Send signed transactions to Titan with ``eth_sendRawTransaction`` instead of
+``eth_sendBundle`` by adding ``--send-mode raw-transaction``.
 
 Same against Fermi::
 
@@ -173,6 +176,11 @@ class StreamRegion(str, Enum):
     @property
     def ws_url(self) -> str:
         return f"wss://{self.value}.rpc.titanbuilder.xyz/ws/pamm_quote_stream"
+
+
+class SendMode(str, Enum):
+    BUNDLE = "bundle"
+    RAW_TRANSACTION = "raw-transaction"
 
 
 class StateStream:
@@ -575,16 +583,27 @@ async def trade_once(
     )
     if not args.send:
         return
-    # Titan accepts `blockNumber: 0x0` as "include in any block within validity".
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_sendBundle",
-        "params": [{"txs": [raw_tx], "blockNumber": "0x0"}],
-    }
+    if args.send_mode is SendMode.RAW_TRANSACTION:
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [raw_tx],
+        }
+    else:
+        # Titan accepts `blockNumber: 0x0` as "include in any block within validity".
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendBundle",
+            "params": [{"txs": [raw_tx], "blockNumber": "0x0"}],
+        }
     async with http.post(args.titan_url, json=body) as resp:
         text = await resp.text()
-        print(f"[trade] titan status={resp.status} body={text}")
+        print(
+            f"[trade] titan mode={args.send_mode.value} "
+            f"status={resp.status} body={text}"
+        )
     if watcher is not None:
         watcher.track(tx_hash, label, nonce)
 
@@ -690,7 +709,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--send", action="store_true",
-        help="POST bundles to Titan. Without this, runs as a dry-run.",
+        help="POST signed swaps to Titan. Without this, runs as a dry-run.",
+    )
+    p.add_argument(
+        "--send-mode",
+        type=_enum_arg(SendMode, "send-mode"),
+        default=SendMode.BUNDLE,
+        help="Titan submission method when --send is set: "
+             "bundle=eth_sendBundle, raw-transaction=eth_sendRawTransaction.",
     )
     p.add_argument(
         "--once", action="store_true", help="Run one iteration then exit.",
@@ -722,7 +748,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--titan-url", default=TITAN_RPC_DEFAULT,
-        help="Titan bundle RPC URL for eth_sendBundle.",
+        help="Titan RPC URL for bundle or raw transaction submission.",
     )
     args = p.parse_args()
     if args.setup_only and args.skip_setup:
@@ -760,6 +786,9 @@ async def amain() -> None:
         await print_balances(w3, me)
         if args.setup_only:
             return
+
+    if not args.send:
+        print("[dry-run] --send not set; signed swaps will not be submitted to Titan")
 
     state: Optional[StateStream] = None
     if args.stream:

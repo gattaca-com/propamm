@@ -1,14 +1,14 @@
 # PropAMM
 
 Reference scripts for trading against propAMM protocols (FermiSwap, Kipseli,
-Bebop) through Titan's bundle relay.
+Bebop) through Titan's RPC.
 
 Three scripts, same protocol family:
 
 | Script | What it does |
 |---|---|
 | `quoter.py` | Subscribe to Titan's pAMM state-diff WebSocket and run pre-trade quote sims against the current state override. |
-| `taker.py` / `src/main.rs` | Wrap ETH, set approvals, sign + submit swap bundles to Titan. Python and Rust ports are byte-equivalent. |
+| `taker.py` / `src/main.rs` | Wrap ETH, set approvals, sign + submit swaps to Titan as bundles or raw transactions. Python and Rust ports are byte-equivalent. |
 | `contracts/KipseliGuard.sol` | Optional permissionless slippage-checking wrapper around the Kipseli pool. |
 
 All three scripts accept `--eth-rpc-url <URL>`. You need a mainnet RPC that
@@ -68,6 +68,16 @@ python taker.py --eth-rpc-url <your-rpc-url> \
     --min-priority-gwei 5 --interval-secs 3
 ```
 
+Submit the signed transaction with Titan's `eth_sendRawTransaction` instead of
+`eth_sendBundle`:
+
+```sh
+python taker.py --eth-rpc-url <your-rpc-url> \
+    --contract fermi --stream --send --send-mode raw-transaction --skip-setup \
+    --pair weth/usdc --notional-usd 2 \
+    --min-priority-gwei 5 --interval-secs 3
+```
+
 Same against Bebop:
 
 ```sh
@@ -80,7 +90,7 @@ python taker.py --eth-rpc-url <your-rpc-url> \
 Flags: `--contract {fermi|bebop|kipseli}` `--pair {weth/usdc|weth/usdt}`
 `--notional-usd N` `--slippage-bps N`
 `--min-priority-gwei N` `--interval-secs N` `--reserve-eth F` `--target-weth F`
-`--send` `--once` `--setup-only` `--skip-setup` `--stream`
+`--send` `--send-mode {bundle|raw-transaction}` `--once` `--setup-only` `--skip-setup` `--stream`
 `--stream-region {eu|ap|us}` `--titan-url URL`. The ETH/USDC mid used to size
 the WETH leg is auto-fetched from Binance and refreshed every second. On a
 successful landing the script prints a short `🚀 LANDED` banner with the
@@ -97,6 +107,9 @@ cargo run --release -- --eth-rpc-url <your-rpc-url> \
     --pair weth/usdc --notional-usd 2 \
     --min-priority-gwei 5 --interval-secs 3
 ```
+
+Use `--send-mode raw-transaction` for Titan's documented
+`eth_sendRawTransaction` submission path.
 
 ## Stream-gated submission
 
