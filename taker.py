@@ -544,28 +544,38 @@ async def trade_once(
     else:
         calldata = cd_kipseli_swap(token_in, amount_in, token_out, min_out)
 
+    target_block_number = None
     if state is not None:
-        await state.changed()
-        frame = state.borrow_and_update()
-        while frame is None:
+        while True:
             await state.changed()
             frame = state.borrow_and_update()
-        block_number, timestamp_secs, state_override = frame
-        call = {
-            "from": me,
-            "to": args.contract.address,
-            "data": "0x" + calldata.hex(),
-        }
-        block_overrides = {
-            "number": hex(block_number),
-            "time": hex(timestamp_secs),
-        }
-        params = [call, "latest", state_override, block_overrides]
-        response = await w3.provider.make_request("eth_call", params)
-        if response.get("error"):
-            print(f"[trade] state-override sim reverts, skipping: {response['error']}")
-            return
-        print(f"[trade] state-override sim ok @ block {block_number}")
+            if frame is None:
+                continue
+            block_number, timestamp_secs, state_override = frame
+            call = {
+                "from": me,
+                "to": args.contract.address,
+                "data": "0x" + calldata.hex(),
+            }
+            block_overrides = {
+                "number": hex(block_number),
+                "time": hex(timestamp_secs),
+            }
+            params = [call, "latest", state_override, block_overrides]
+            response = await w3.provider.make_request("eth_call", params)
+            if response.get("error"):
+                error_text = str(response["error"])
+                if "0x666a2814" in error_text:
+                    print(
+                        f"[trade] stale {args.contract.label} update "
+                        f"@ block {block_number}, waiting"
+                    )
+                    continue
+                print(f"[trade] state-override sim reverts, skipping: {response['error']}")
+                return
+            print(f"[trade] state-override sim ok @ block {block_number}")
+            target_block_number = block_number
+            break
 
     raw_tx, tx_hash = build_signed_tx(
         account,
@@ -591,12 +601,16 @@ async def trade_once(
             "params": [raw_tx],
         }
     else:
-        # Titan accepts `blockNumber: 0x0` as "include in any block within validity".
+        block_number = (
+            target_block_number
+            if target_block_number is not None
+            else await w3.eth.block_number + 1
+        )
         body = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_sendBundle",
-            "params": [{"txs": [raw_tx], "blockNumber": "0x0"}],
+            "params": [{"txs": [raw_tx], "blockNumber": hex(block_number)}],
         }
     async with http.post(args.titan_url, json=body) as resp:
         text = await resp.text()

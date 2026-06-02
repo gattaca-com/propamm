@@ -90,7 +90,8 @@ const WETH: Address = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
 const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 const USDT: Address = address!("dac17f958d2ee523a2206206994597c13d831ec7");
 const FERMI_SWAPPER: Address = address!("b1076fe3ab5e28005c7c323bac5ac06a680d452e");
-const BEBOP: Address = address!("160141a205f5ddcf096ba3f48b7ed21eb52c62ea");
+const BEBOP: Address = address!("bc60639345dfa607d73b74e88c2d54d8b8ad7cc3");
+const BEBOP_SWAPPER: Address = address!("db13ad0fcd134e9c48f2fdaea8f6751a0f5349ca");
 // Optional permissionless slippage-checking wrapper around the Kipseli pool;
 // callers may bypass it and call KIPSELI_POOL directly.
 const KIPSELI_GUARD: Address = address!("9a7a5dccc7851c0f141d07c4d608a29b3830548b");
@@ -98,6 +99,9 @@ const KIPSELI_POOL: Address = address!("5cdbe59400cc2efdcc2b54acca4a99fe00dd588c
 
 const STABLE_DECIMALS: u32 = 6;
 const BEBOP_EXPIRY_SECS: u64 = 120;
+const BEACON_GENESIS_TS: u64 = 1_606_824_023;
+const SECONDS_PER_SLOT: u64 = 12;
+const RECEIPT_WAIT_SECS: u64 = 90;
 
 type StateStreamFrame = (u64, u64, Value);
 type StateStreamRx = watch::Receiver<Option<StateStreamFrame>>;
@@ -127,6 +131,7 @@ sol! {
             uint256 amountIn,
             uint256 minAmountOut,
             uint256 expiry,
+            address recipient,
         ) external payable;
     }
     interface IKipseliGuard {
@@ -157,7 +162,7 @@ impl Contract {
     fn address(self) -> Address {
         match self {
             Self::Fermi => FERMI_SWAPPER,
-            Self::Bebop => BEBOP,
+            Self::Bebop => BEBOP_SWAPPER,
             Self::Kipseli => KIPSELI_GUARD,
         }
     }
@@ -422,6 +427,27 @@ async fn tx_monitor(rpc_url: String, mut rx: mpsc::UnboundedReceiver<(B256, Stri
     }
 }
 
+async fn wait_for_receipt<P: Provider>(
+    provider: &P,
+    label: &str,
+    tx_hash: B256,
+    nonce: u64,
+) -> Result<()> {
+    for _ in 0..RECEIPT_WAIT_SECS {
+        if let Some(r) = provider.get_transaction_receipt(tx_hash).await? {
+            let ok = r.status();
+            let block = r.block_number.unwrap_or(0);
+            print_landed_banner(label, tx_hash, nonce, block, ok);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    println!(
+        "[monitor] no receipt after {RECEIPT_WAIT_SECS}s label={label} nonce={nonce} tx={tx_hash:#x}"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
@@ -683,6 +709,7 @@ async fn trade_once<P: Provider>(
                 amountIn: amount_in,
                 minAmountOut: min_out,
                 expiry,
+                recipient: me,
             }
             .abi_encode()
         }
@@ -695,31 +722,42 @@ async fn trade_once<P: Provider>(
         .abi_encode(),
     };
 
+    let mut target_block_number = None;
     if let Some(rx) = stream_rx {
-        let (block_number, timestamp_secs, state_override) = loop {
+        loop {
             rx.changed().await?;
             if let Some(frame) = rx.borrow_and_update().clone() {
-                break frame;
-            }
-        };
-        let call = json!({
-            "from": me,
-            "to": args.contract.address(),
-            "data": format!("0x{}", hex::encode(&calldata)),
-        });
-        let block_overrides = json!({
-            "number": format!("0x{block_number:x}"),
-            "time": format!("0x{timestamp_secs:x}"),
-        });
-        let params = json!([call, "latest", state_override, block_overrides]);
-        match provider
-            .raw_request::<_, Bytes>("eth_call".into(), params)
-            .await
-        {
-            Ok(_) => println!("[trade] state-override sim ok @ block {block_number}"),
-            Err(e) => {
-                println!("[trade] state-override sim reverts, skipping: {e}");
-                return Ok(());
+                let (block_number, timestamp_secs, state_override) = frame;
+                let call = json!({
+                    "from": me,
+                    "to": args.contract.address(),
+                    "data": format!("0x{}", hex::encode(&calldata)),
+                });
+                let block_overrides = json!({
+                    "number": format!("0x{block_number:x}"),
+                    "time": format!("0x{timestamp_secs:x}"),
+                });
+                let params = json!([call, "latest", state_override, block_overrides]);
+                match provider
+                    .raw_request::<_, Bytes>("eth_call".into(), params)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("[trade] state-override sim ok @ block {block_number}");
+                        target_block_number = Some(block_number);
+                        break;
+                    }
+                    Err(e) if e.to_string().contains("0x666a2814") => {
+                        println!(
+                            "[trade] stale {} update @ block {block_number}, waiting",
+                            args.contract.label()
+                        );
+                    }
+                    Err(e) => {
+                        println!("[trade] state-override sim reverts, skipping: {e}");
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -743,12 +781,18 @@ async fn trade_once<P: Provider>(
     }
     let body = match args.send_mode {
         SendMode::Bundle => {
-            // Titan accepts `blockNumber: 0x0` as "include in any block within validity".
+            let block_number = match target_block_number {
+                Some(block_number) => block_number,
+                None => provider.get_block_number().await? + 1,
+            };
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "eth_sendBundle",
-                "params": [{ "txs": [raw_tx], "blockNumber": "0x0" }],
+                "params": [{
+                    "txs": [raw_tx],
+                    "blockNumber": format!("0x{block_number:x}"),
+                }],
             })
         }
         SendMode::RawTransaction => json!({
@@ -765,7 +809,9 @@ async fn trade_once<P: Provider>(
         resp.status(),
         resp.text().await?
     );
-    if let Some(mt) = mon_tx {
+    if args.once {
+        wait_for_receipt(provider, &label, tx_hash, nonce).await?;
+    } else if let Some(mt) = mon_tx {
         let _ = mt.send((tx_hash, label.clone(), nonce));
     }
     Ok(())
@@ -821,9 +867,14 @@ async fn run_state_stream(region: StreamRegion, contract: Address, tx: StateStre
                     continue;
                 };
                 let timestamp_secs = obj
-                    .get("timestamp")
-                    .and_then(|t| t.as_u64())
-                    .map(|ns| ns / 1_000_000_000)
+                    .get("slot")
+                    .and_then(|slot| slot.as_u64())
+                    .map(|slot| BEACON_GENESIS_TS + slot * SECONDS_PER_SLOT)
+                    .or_else(|| {
+                        obj.get("timestamp")
+                            .and_then(|t| t.as_u64())
+                            .map(|ns| ns / 1_000_000_000)
+                    })
                     .unwrap_or(0);
                 if let Some(entry) = obj.iter().find(|(k, _)| k.to_lowercase() == contract_lc)
                     && let Some(so) = entry

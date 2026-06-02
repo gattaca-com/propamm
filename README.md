@@ -160,7 +160,7 @@ block overrides, and skips submission when the sim reverts.
 | Contract | Address |
 |---|---|
 | FermiSwap | `0xb1076fe3ab5e28005c7c323bac5ac06a680d452e` |
-| Bebop     | `0x160141a205f5ddcf096ba3f48b7ed21eb52c62ea` |
+| BebopSwapper | `0xdb13ad0fcd134e9c48f2fdaea8f6751a0f5349ca` (stream key `0xbc60639345dfa607d73b74e88c2d54d8b8ad7cc3`) |
 | KipseliGuard | `0x9a7a5dccc7851c0f141d07c4d608a29b3830548b` (optional wrapper around `0x5cdbe594…d588c`) |
 
 ## Troubleshooting
