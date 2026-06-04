@@ -88,6 +88,12 @@ One-time setup (wrap ETH, grant ERC20 approvals to the target contract):
 python taker.py --eth-rpc-url <your-rpc-url> --contract fermi --setup-only
 ```
 
+Set up all contracts and wrap half, capped by the gas reserve:
+
+```sh
+python taker.py --eth-rpc-url <your-rpc-url> --contract all --setup-only --wrap
+```
+
 Dry-run a single trade (no `--send`):
 
 ```sh
@@ -124,12 +130,14 @@ python taker.py --eth-rpc-url <your-rpc-url> \
     --min-priority-gwei 5 --interval-secs 3
 ```
 
-Flags: `--contract {fermi|bebop|kipseli}` `--pair {weth/usdc|weth/usdt}`
+Flags: `--contract {fermi|bebop|kipseli|all}` `--pair {weth/usdc|weth/usdt}`
 `--notional-usd N` `--slippage-bps N`
-`--min-priority-gwei N` `--interval-secs N` `--reserve-eth F` `--target-weth F`
+`--min-priority-gwei N` `--interval-secs N` `--reserve-eth F`
+`--target-weth F` `--wrap [F]`
 `--send` `--send-mode {bundle|raw-transaction}` `--once` `--setup-only` `--skip-setup` `--stream`
-`--stream-region {eu|ap|us}` `--titan-url URL`. The ETH/USDC mid used to size
-the WETH leg is auto-fetched from Binance and refreshed every second. On a
+`--stream-region {eu|ap|us}` `--titan-url URL`. During trading, the ETH/USDC
+mid used to size the WETH leg is auto-fetched from Binance and refreshed every
+second. On a
 successful landing the script prints a short `🚀 LANDED` banner with the
 block + etherscan link; if a tracked tx's nonce gets consumed by a different
 tx the script prints a `[dropped]` line and stops polling that hash.

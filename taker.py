@@ -19,6 +19,11 @@ One-time setup (wrap ETH and grant ERC20 approvals to the target contract)::
     python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
         --contract kipseli --setup-only
 
+Set up all contracts and wrap half, capped by the gas reserve::
+
+    python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
+        --contract all --setup-only --wrap
+
 Single-shot dry-run (no ``--send``) — prints the calldata and tx hash that
 would be submitted but does not POST to Titan::
 
@@ -64,6 +69,7 @@ import json
 import os
 import sys
 import urllib.request
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -76,6 +82,9 @@ from web3 import AsyncHTTPProvider, AsyncWeb3
 
 TITAN_RPC_DEFAULT = "https://rpc.titanbuilder.xyz/"
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDC"
+GWEI_WEI = Decimal("1000000000")
+ETH_WEI = Decimal("1000000000000000000")
+WRAP_HALF = object()
 
 WETH = to_checksum_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
 USDC = to_checksum_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
@@ -114,6 +123,7 @@ class Contract(str, Enum):
     FERMI = "fermi"
     BEBOP = "bebop"
     KIPSELI = "kipseli"
+    ALL = "all"
 
     @property
     def label(self) -> str:
@@ -121,10 +131,13 @@ class Contract(str, Enum):
             Contract.FERMI: "FermiSwapper",
             Contract.BEBOP: "Bebop",
             Contract.KIPSELI: "Kipseli",
+            Contract.ALL: "all",
         }[self]
 
     @property
     def address(self) -> str:
+        if self is Contract.ALL:
+            raise RuntimeError("all has no single contract address")
         return {
             Contract.FERMI: FERMI_SWAPPER,
             Contract.BEBOP: BEBOP_SWAPPER,
@@ -133,10 +146,14 @@ class Contract(str, Enum):
 
     @property
     def gas_limit(self) -> int:
+        if self is Contract.ALL:
+            raise RuntimeError("all has no single gas limit")
         return 600_000 if self is Contract.KIPSELI else 300_000
 
     @property
     def stream_key(self) -> Optional[str]:
+        if self is Contract.ALL:
+            raise RuntimeError("all has no stream key")
         return {
             Contract.FERMI: FERMI_SWAPPER,
             Contract.KIPSELI: KIPSELI_POOL,
@@ -385,7 +402,9 @@ async def estimate_eip1559(w3: AsyncWeb3) -> Tuple[int, int]:
     return base_fee * 2 + max_priority, max_priority
 
 
-async def send_with_account(w3: AsyncWeb3, account, tx: dict) -> dict:
+async def send_with_account(
+    w3: AsyncWeb3, account, tx: dict, label: str, min_priority_wei: int
+) -> dict:
     tx = dict(tx)
     tx.setdefault("from", account.address)
     tx.setdefault("type", 2)
@@ -396,56 +415,94 @@ async def send_with_account(w3: AsyncWeb3, account, tx: dict) -> dict:
         tx["chainId"] = await w3.eth.chain_id
     if "maxFeePerGas" not in tx:
         max_fee, max_prio = await estimate_eip1559(w3)
-        tx["maxFeePerGas"] = max_fee
+        max_prio = max(max_prio, min_priority_wei)
+        tx["maxFeePerGas"] = max(max_fee, max_prio * 3)
         tx["maxPriorityFeePerGas"] = max_prio
     if "gas" not in tx:
         tx["gas"] = await w3.eth.estimate_gas(tx)
     signed = account.sign_transaction(tx)
     tx_hash = await w3.eth.send_raw_transaction(_raw_tx(signed))
+    tx_hash_s = tx_hash.hex()
+    if not tx_hash_s.startswith("0x"):
+        tx_hash_s = "0x" + tx_hash_s
+    print(f"[setup] submitted {label} tx={tx_hash_s}")
     return await w3.eth.wait_for_transaction_receipt(tx_hash)
+
+
+def setup_contracts(contract: Contract) -> Tuple[Contract, ...]:
+    if contract is Contract.ALL:
+        return (Contract.FERMI, Contract.BEBOP, Contract.KIPSELI)
+    return (contract,)
+
+
+async def setup_wrap(w3: AsyncWeb3, account, args, me: str) -> None:
+    eth_bal = await w3.eth.get_balance(me)
+    reserve_wei = int(args.reserve_eth * 1e18)
+
+    if args.wrap is WRAP_HALF:
+        if eth_bal <= reserve_wei:
+            raise RuntimeError(f"ETH {eth_bal} <= reserve {reserve_wei}, cannot wrap")
+        wrap_amt = min(eth_bal // 2, eth_bal - reserve_wei)
+    elif args.wrap is not None:
+        wrap_amt = args.wrap
+        if eth_bal - reserve_wei < wrap_amt:
+            raise RuntimeError(
+                f"ETH available {eth_bal - reserve_wei} < wrap amount {wrap_amt}"
+            )
+    else:
+        weth_bal = await read_uint256(w3, WETH, cd_balance_of(me))
+        target_wei = int(args.target_weth * 1e18)
+        if weth_bal >= target_wei:
+            return
+        if eth_bal <= reserve_wei:
+            raise RuntimeError(f"ETH {eth_bal} <= reserve {reserve_wei}, cannot wrap")
+        need = target_wei - weth_bal
+        available = eth_bal - reserve_wei
+        if available < need:
+            raise RuntimeError(
+                f"ETH available {available} < need {need} to reach target WETH"
+            )
+        wrap_amt = max(min(available, need * 2), need)
+
+    if wrap_amt <= 0:
+        return
+    print(f"[setup] wrapping {wrap_amt} wei ETH -> WETH")
+    receipt = await send_with_account(
+        w3,
+        account,
+        {"to": WETH, "value": wrap_amt, "data": SEL_DEPOSIT},
+        "WETH deposit",
+        args.min_priority_wei,
+    )
+    print(f"[setup]   wrap mined block={receipt.get('blockNumber')}")
 
 
 async def setup(w3: AsyncWeb3, account, args) -> None:
     me = account.address
-    spender = args.contract.address
-    label = args.contract.label
     weth_target = 100 * 10**18
     stable_target = 100_000 * 10**STABLE_DECIMALS
-    for token, sym, target in (
-        (WETH, "WETH", weth_target),
-        (USDC, "USDC", stable_target),
-        (USDT, "USDT", stable_target),
-    ):
-        allowance = await read_uint256(w3, token, cd_allowance(me, spender))
-        if allowance >= target:
-            print(f"[setup] {sym} already approved")
-            continue
-        print(f"[setup] approving {sym} -> {label}")
-        receipt = await send_with_account(
-            w3, account, {"to": token, "data": cd_approve(spender, target)}
-        )
-        print(f"[setup]   {sym} approve mined block={receipt.get('blockNumber')}")
-
-    weth_bal = await read_uint256(w3, WETH, cd_balance_of(me))
-    target_wei = int(args.target_weth * 1e18)
-    if weth_bal >= target_wei:
-        return
-    eth_bal = await w3.eth.get_balance(me)
-    reserve_wei = int(args.reserve_eth * 1e18)
-    if eth_bal <= reserve_wei:
-        raise RuntimeError(f"ETH {eth_bal} <= reserve {reserve_wei}, cannot wrap")
-    need = target_wei - weth_bal
-    available = eth_bal - reserve_wei
-    if available < need:
-        raise RuntimeError(
-            f"ETH available {available} < need {need} to reach target WETH"
-        )
-    wrap_amt = max(min(available, need * 2), need)
-    print(f"[setup] wrapping {wrap_amt} wei ETH -> WETH")
-    receipt = await send_with_account(
-        w3, account, {"to": WETH, "value": wrap_amt, "data": SEL_DEPOSIT}
-    )
-    print(f"[setup]   wrap mined block={receipt.get('blockNumber')}")
+    await setup_wrap(w3, account, args, me)
+    for contract in setup_contracts(args.contract):
+        spender = contract.address
+        label = contract.label
+        for token, sym, target in (
+            (WETH, "WETH", weth_target),
+            (USDC, "USDC", stable_target),
+            (USDT, "USDT", stable_target),
+        ):
+            allowance = await read_uint256(w3, token, cd_allowance(me, spender))
+            if allowance >= target:
+                print(f"[setup] {sym} already approved for {label}")
+                continue
+            print(f"[setup] approving {sym} -> {label}")
+            receipt = await send_with_account(
+                w3,
+                account,
+                {"to": token, "data": cd_approve(spender, target)},
+                f"{sym} approve -> {label}",
+                args.min_priority_wei,
+            )
+            print(f"[setup]   {sym} approve mined block={receipt.get('blockNumber')}")
 
 
 def build_signed_tx(
@@ -487,7 +544,7 @@ async def trade_once(
     me = account.address
     nonce = await w3.eth.get_transaction_count(me, "pending")
     max_fee, max_priority = await estimate_eip1559(w3)
-    max_priority = max(max_priority, args.min_priority_gwei * 1_000_000_000)
+    max_priority = max(max_priority, args.min_priority_wei)
     max_fee = max(max_fee, max_priority * 3)
 
     stable_pair = args.pair is Pair.USDC_USDT
@@ -681,6 +738,30 @@ def _enum_arg(cls, name: str):
     return parse
 
 
+def _scaled_decimal_to_wei(s: str, scale: Decimal, label: str) -> int:
+    try:
+        value = Decimal(s)
+    except InvalidOperation as e:
+        raise argparse.ArgumentTypeError(f"invalid {label} value {s!r}") from e
+    if not value.is_finite() or value < 0:
+        raise argparse.ArgumentTypeError(f"invalid {label} value {s!r}")
+
+    wei = value * scale
+    if wei != wei.to_integral_value():
+        raise argparse.ArgumentTypeError(
+            f"invalid {label} value {s!r}: below wei precision"
+        )
+    return int(wei)
+
+
+def _gwei_to_wei(s: str) -> int:
+    return _scaled_decimal_to_wei(s, GWEI_WEI, "gwei")
+
+
+def _eth_to_wei(s: str) -> int:
+    return _scaled_decimal_to_wei(s, ETH_WEI, "ETH")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="pAMM taker: wrap ETH, approve, and send a swap bundle to Titan."
@@ -689,7 +770,7 @@ def parse_args() -> argparse.Namespace:
         "--contract",
         type=_enum_arg(Contract, "contract"),
         default=Contract.FERMI,
-        help="Target pAMM contract (fermi|bebop|kipseli).",
+        help="Target pAMM contract (fermi|bebop|kipseli|all).",
     )
     p.add_argument(
         "--notional-usd", type=float, default=1.0,
@@ -706,8 +787,12 @@ def parse_args() -> argparse.Namespace:
         help="Slippage tolerance applied to amountCheck / minOut.",
     )
     p.add_argument(
-        "--min-priority-gwei", type=int, default=1,
-        help="Floor for max_priority_fee_per_gas.",
+        "--min-priority-gwei",
+        dest="min_priority_wei",
+        type=_gwei_to_wei,
+        default=_gwei_to_wei("1"),
+        metavar="GWEI",
+        help="Floor for max_priority_fee_per_gas, in decimal gwei.",
     )
     p.add_argument(
         "--interval-secs", type=int, default=12,
@@ -720,6 +805,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--target-weth", type=float, default=0.02,
         help="Wrap ETH if WETH balance falls below this.",
+    )
+    p.add_argument(
+        "--wrap",
+        nargs="?",
+        const=WRAP_HALF,
+        default=None,
+        type=_eth_to_wei,
+        metavar="ETH",
+        help="During setup, wrap this ETH amount. "
+             "Bare --wrap wraps half, capped by reserve.",
     )
     p.add_argument(
         "--send", action="store_true",
@@ -767,6 +862,10 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.setup_only and args.skip_setup:
         p.error("--setup-only conflicts with --skip-setup")
+    if args.wrap is not None and args.skip_setup:
+        p.error("--wrap conflicts with --skip-setup")
+    if args.contract is Contract.ALL and not args.setup_only:
+        p.error("--contract all requires --setup-only")
     return args
 
 
@@ -786,12 +885,6 @@ async def amain() -> None:
     if chain_id != 1:
         print(f"warning: chain_id={chain_id}, expected 1 (mainnet)")
 
-    try:
-        args.eth_price_usd = fetch_binance_mid()
-    except Exception as e:
-        sys.exit(f"failed to fetch ETH/USDC mid from Binance: {e}")
-    asyncio.create_task(refresh_binance_mid(args))
-
     print(f"signer={me} chain_id={chain_id} contract={args.contract.label}")
     await print_balances(w3, me)
 
@@ -800,6 +893,12 @@ async def amain() -> None:
         await print_balances(w3, me)
         if args.setup_only:
             return
+
+    try:
+        args.eth_price_usd = fetch_binance_mid()
+    except Exception as e:
+        sys.exit(f"failed to fetch ETH/USDC mid from Binance: {e}")
+    asyncio.create_task(refresh_binance_mid(args))
 
     if not args.send:
         print("[dry-run] --send not set; signed swaps will not be submitted to Titan")
