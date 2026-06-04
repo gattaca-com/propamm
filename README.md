@@ -1,17 +1,18 @@
 # PropAMM
 
 Reference scripts for trading against propAMM protocols (FermiSwap, Kipseli,
-Bebop) through Titan's RPC.
+Bebop) through Titan's quote stream and builder RPCs.
 
-Three scripts, same protocol family:
+Main entry points:
 
 | Script | What it does |
 |---|---|
 | `quoter.py` | Subscribe to Titan's pAMM state-diff WebSocket and run taker-sized quote sims against the current state override. |
-| `taker.py` / `src/main.rs` | Wrap ETH, set approvals, sign + submit swaps to Titan as bundles or raw transactions. Python and Rust ports are byte-equivalent. |
+| `taker.py` | Wrap ETH, set approvals, sign + submit swaps to named or custom builder RPCs as bundles or raw transactions. |
+| `src/main.rs` | Rust taker port for Titan bundle or raw transaction submission. |
 | `contracts/KipseliGuard.sol` | Optional permissionless slippage-checking wrapper around the Kipseli pool. |
 
-All three scripts accept `--eth-rpc-url <URL>`. You need a mainnet RPC that
+The script entry points accept `--eth-rpc-url <URL>`. You need a mainnet RPC that
 supports `eth_call` with state and block overrides (Alchemy, Infura, self-hosted
 Geth/Reth). Public free RPCs typically don't.
 
@@ -111,7 +112,24 @@ python taker.py --eth-rpc-url <your-rpc-url> \
     --min-priority-gwei 5 --interval-secs 3
 ```
 
-Submit the signed transaction with Titan's `eth_sendRawTransaction` instead of
+By default, `--send` posts to `titan`, `buidlernet`, and `quasar`. Append
+builder names or RPC URLs to send only to those targets:
+
+```sh
+python taker.py --eth-rpc-url <your-rpc-url> \
+    --contract fermi --stream --send --skip-setup \
+    --pair weth/usdc --notional-usd 2 \
+    titan buidlernet
+
+python taker.py --eth-rpc-url <your-rpc-url> \
+    --contract fermi --send --skip-setup --once \
+    --pair weth/usdc --notional-usd 2 \
+    127.0.0.1:12
+```
+
+Bare host:port custom endpoints are sent as `http://host:port`.
+
+Submit the signed transaction with `eth_sendRawTransaction` instead of
 `eth_sendBundle`:
 
 ```sh
@@ -135,7 +153,9 @@ Flags: `--contract {fermi|bebop|kipseli|all}` `--pair {weth/usdc|weth/usdt}`
 `--min-priority-gwei N` `--interval-secs N` `--reserve-eth F`
 `--target-weth F` `--wrap [F]`
 `--send` `--send-mode {bundle|raw-transaction}` `--once` `--setup-only` `--skip-setup` `--stream`
-`--stream-region {eu|ap|us}` `--titan-url URL`. During trading, the ETH/USDC
+`--stream-region {eu|ap|us}` `--titan-url URL` `[builders ...]`.
+Builders may be `titan`, `buidlernet`, `quasar`, or RPC URLs. During trading,
+the ETH/USDC
 mid used to size the WETH leg is auto-fetched from Binance and refreshed every
 second. On a
 successful landing the script prints a short `🚀 LANDED` banner with the

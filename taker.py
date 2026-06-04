@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""pAMM taker — wraps ETH, sets approvals, sends swaps to Titan.
+"""pAMM taker — wraps ETH, sets approvals, sends swaps to builders.
 
 Targets FermiSwapper (default), Bebop, or KipseliGuard.
 
 Reads the signer private key from ``PROP_AMM_TAKER_PRIVATE_KEY`` (hex, with or
-without ``0x``). The mainnet RPC URL and Titan URL are passed via ``--eth-rpc-url``
-and ``--titan-url``. The mainnet RPC must support ``eth_call`` with state and
-block overrides (Alchemy / Infura / self-hosted).
+without ``0x``). The mainnet RPC URL is passed via ``--eth-rpc-url``. The
+mainnet RPC must support ``eth_call`` with state and block overrides
+(Alchemy / Infura / self-hosted).
 
 ## Examples
 
@@ -25,21 +25,25 @@ Set up all contracts and wrap half, capped by the gas reserve::
         --contract all --setup-only --wrap
 
 Single-shot dry-run (no ``--send``) — prints the calldata and tx hash that
-would be submitted but does not POST to Titan::
+would be submitted but does not POST to builders::
 
     python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
         --contract fermi --stream --skip-setup --once \\
         --pair weth/usdc --notional-usd 2
 
-Continuous stream-gated $2 WETH/USDC swaps against Kipseli via Titan::
+Continuous stream-gated $2 WETH/USDC swaps against Kipseli via all builders::
 
     python taker.py --eth-rpc-url "$ETH_RPC_URL" \\
         --contract kipseli --stream --send --skip-setup \\
         --pair weth/usdc --notional-usd 2 \\
         --min-priority-gwei 5 --interval-secs 3
 
-Send signed transactions to Titan with ``eth_sendRawTransaction`` instead of
+Send signed transactions with ``eth_sendRawTransaction`` instead of
 ``eth_sendBundle`` by adding ``--send-mode raw-transaction``.
+
+Append builder names or RPC URLs to send only to those builders, for example
+``titan buidlernet`` or ``127.0.0.1:12``. Bare host:port custom endpoints use
+``http://``. With no builder args, sends go to all hardcoded builders.
 
 Same against Fermi::
 
@@ -68,6 +72,7 @@ import asyncio
 import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -81,6 +86,11 @@ from eth_utils import keccak, to_checksum_address
 from web3 import AsyncHTTPProvider, AsyncWeb3
 
 TITAN_RPC_DEFAULT = "https://rpc.titanbuilder.xyz/"
+BUILDER_RPCS = {
+    "titan": TITAN_RPC_DEFAULT,
+    "buidlernet": "https://rpc.buildernet.org:433",
+    "quasar": "https://rpc.quasar.win",
+}
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDC"
 GWEI_WEI = Decimal("1000000000")
 ETH_WEI = Decimal("1000000000000000000")
@@ -669,14 +679,28 @@ async def trade_once(
             "method": "eth_sendBundle",
             "params": [{"txs": [raw_tx], "blockNumber": hex(block_number)}],
         }
-    async with http.post(args.titan_url, json=body) as resp:
-        text = await resp.text()
-        print(
-            f"[trade] titan mode={args.send_mode.value} "
-            f"status={resp.status} body={text}"
-        )
-    if watcher is not None:
+    replied = await asyncio.gather(*(
+        post_to_builder(http, name, url, args.send_mode, body)
+        for name, url in args.builder_targets
+    ))
+    if watcher is not None and any(replied):
         watcher.track(tx_hash, label, nonce)
+
+
+async def post_to_builder(
+    http: aiohttp.ClientSession, name: str, url: str, mode: SendMode, body: dict
+) -> bool:
+    try:
+        async with http.post(url, json=body) as resp:
+            text = await resp.text()
+            print(
+                f"[trade] {name} mode={mode.value} "
+                f"status={resp.status} body={text}"
+            )
+            return True
+    except Exception as e:
+        print(f"[trade] {name} mode={mode.value} error={e}")
+        return False
 
 
 async def run_state_stream(
@@ -738,6 +762,51 @@ def _enum_arg(cls, name: str):
     return parse
 
 
+def _custom_builder_url(token: str) -> str:
+    if "://" in token:
+        url = token
+    elif ":" in token:
+        url = "http://" + token
+    else:
+        raise argparse.ArgumentTypeError(
+            f"unknown builder {token!r}; use a known name, URL, or host:port"
+        )
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise argparse.ArgumentTypeError(
+            f"invalid builder URL {token!r}; use http(s)://host[:port]"
+        )
+    return url
+
+
+def _builder_targets(
+    tokens: list[str], titan_url: str
+) -> Tuple[Tuple[str, str], ...]:
+    rpcs = dict(BUILDER_RPCS)
+    rpcs["titan"] = titan_url
+    selected = []
+    seen = set()
+    for token in tokens:
+        for part in token.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            alias = part.lower()
+            if alias in rpcs:
+                target = (alias, rpcs[alias])
+                key = ("alias", alias)
+            else:
+                url = _custom_builder_url(part)
+                target = (url, url)
+                key = ("url", url)
+            if key not in seen:
+                selected.append(target)
+                seen.add(key)
+    if selected:
+        return tuple(selected)
+    return tuple((name, rpcs[name]) for name in BUILDER_RPCS)
+
+
 def _scaled_decimal_to_wei(s: str, scale: Decimal, label: str) -> int:
     try:
         value = Decimal(s)
@@ -764,7 +833,13 @@ def _eth_to_wei(s: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="pAMM taker: wrap ETH, approve, and send a swap bundle to Titan."
+        description="pAMM taker: wrap ETH, approve, and send swaps to builders."
+    )
+    p.add_argument(
+        "builders",
+        nargs="*",
+        help="Builders to submit to: titan, buidlernet, quasar, or RPC URLs. "
+             "Bare host:port uses http://. Omit to submit to all.",
     )
     p.add_argument(
         "--contract",
@@ -818,13 +893,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--send", action="store_true",
-        help="POST signed swaps to Titan. Without this, runs as a dry-run.",
+        help="POST signed swaps to the selected builders. "
+             "Without this, runs as a dry-run.",
     )
     p.add_argument(
         "--send-mode",
         type=_enum_arg(SendMode, "send-mode"),
         default=SendMode.BUNDLE,
-        help="Titan submission method when --send is set: "
+        help="Submission method when --send is set: "
              "bundle=eth_sendBundle, raw-transaction=eth_sendRawTransaction.",
     )
     p.add_argument(
@@ -857,9 +933,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--titan-url", default=TITAN_RPC_DEFAULT,
-        help="Titan RPC URL for bundle or raw transaction submission.",
+        help="Override the Titan RPC URL for bundle or raw transaction submission.",
     )
     args = p.parse_args()
+    try:
+        args.builder_targets = _builder_targets(args.builders, args.titan_url)
+    except argparse.ArgumentTypeError as e:
+        p.error(str(e))
     if args.setup_only and args.skip_setup:
         p.error("--setup-only conflicts with --skip-setup")
     if args.wrap is not None and args.skip_setup:
@@ -885,7 +965,11 @@ async def amain() -> None:
     if chain_id != 1:
         print(f"warning: chain_id={chain_id}, expected 1 (mainnet)")
 
-    print(f"signer={me} chain_id={chain_id} contract={args.contract.label}")
+    builders = ",".join(name for name, _ in args.builder_targets)
+    print(
+        f"signer={me} chain_id={chain_id} contract={args.contract.label} "
+        f"builders={builders}"
+    )
     await print_balances(w3, me)
 
     if not args.skip_setup:
@@ -901,7 +985,7 @@ async def amain() -> None:
     asyncio.create_task(refresh_binance_mid(args))
 
     if not args.send:
-        print("[dry-run] --send not set; signed swaps will not be submitted to Titan")
+        print("[dry-run] --send not set; signed swaps will not be submitted")
 
     state: Optional[StateStream] = None
     if args.stream:
