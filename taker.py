@@ -99,7 +99,7 @@ WRAP_HALF = object()
 WETH = to_checksum_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
 USDC = to_checksum_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
 USDT = to_checksum_address("0xdac17f958d2ee523a2206206994597c13d831ec7")
-FERMI_SWAPPER = to_checksum_address("0xb1076fe3ab5e28005c7c323bac5ac06a680d452e")
+FERMI_SWAPPER = to_checksum_address("0x5979458912F80B96d30D4220af8E2e4925A33320")
 BEBOP = to_checksum_address("0xbc60639345dfa607d73b74e88c2d54d8b8ad7cc3")
 BEBOP_SWAPPER = to_checksum_address("0xdb13ad0fcd134e9c48f2fdaea8f6751a0f5349ca")
 # Optional permissionless slippage-checking wrapper around the Kipseli pool;
