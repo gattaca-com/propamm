@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pAMM taker — wraps ETH, sets approvals, sends swaps to builders.
 
-Targets FermiSwapper (default), Bebop, or KipseliGuard.
+Targets FermiSwapper (default), Bebop, KipseliGuard, or Metric.
 
 Reads the signer private key from ``PROP_AMM_TAKER_PRIVATE_KEY`` (hex, with or
 without ``0x``). The mainnet RPC URL is passed via ``--eth-rpc-url``. The
@@ -106,9 +106,12 @@ BEBOP_SWAPPER = to_checksum_address("0xdb13ad0fcd134e9c48f2fdaea8f6751a0f5349ca"
 # callers may bypass it and call KIPSELI_POOL directly.
 KIPSELI_GUARD = to_checksum_address("0x9a7a5dccc7851c0f141d07c4d608a29b3830548b")
 KIPSELI_POOL = to_checksum_address("0x5cdbe59400cc2efdcc2b54acca4a99fe00dd588c")
+METRIC = to_checksum_address("0xE715Dc29d2c273D0FC5A03e5Cca9CcB0Abb1dCDB")
+METRIC_ORACLE = to_checksum_address("0x28d9CCEDf1B7ac9B3F090f4F0292837dE87c1D39")
+LAMBDA_ROUTER = to_checksum_address("0x4dDf368080CD7946Db5B459Ad591c350158175e1")
 
 STABLE_DECIMALS = 6
-BEBOP_EXPIRY_SECS = 120
+SWAP_EXPIRY_SECS = 120
 
 BEACON_GENESIS_TS = 1606824023
 SECONDS_PER_SLOT = 12
@@ -127,12 +130,18 @@ SEL_FERMI_SWAP = _selector(
 )
 SEL_BEBOP_SWAP = _selector("swap(address,address,uint256,uint256,uint256,address)")
 SEL_KIPSELI_SWAP = _selector("swap(address,uint256,address,uint256)")
+# Metric implements Lambda's push-payment propAMM interface, so execute through
+# Lambda's router rather than calling the venue directly.
+SEL_LAMBDA_SWAP_VIA_VENUE = _selector(
+    "swapViaVenueV1(address,address,address,uint256,uint256,address,uint256)"
+)
 
 
 class Contract(str, Enum):
     FERMI = "fermi"
     BEBOP = "bebop"
     KIPSELI = "kipseli"
+    METRIC = "metric"
     ALL = "all"
 
     @property
@@ -141,6 +150,7 @@ class Contract(str, Enum):
             Contract.FERMI: "FermiSwapper",
             Contract.BEBOP: "Bebop",
             Contract.KIPSELI: "Kipseli",
+            Contract.METRIC: "Metric",
             Contract.ALL: "all",
         }[self]
 
@@ -152,13 +162,14 @@ class Contract(str, Enum):
             Contract.FERMI: FERMI_SWAPPER,
             Contract.BEBOP: BEBOP_SWAPPER,
             Contract.KIPSELI: KIPSELI_GUARD,
+            Contract.METRIC: LAMBDA_ROUTER,
         }[self]
 
     @property
     def gas_limit(self) -> int:
         if self is Contract.ALL:
             raise RuntimeError("all has no single gas limit")
-        return 600_000 if self is Contract.KIPSELI else 300_000
+        return 600_000 if self in (Contract.KIPSELI, Contract.METRIC) else 300_000
 
     @property
     def stream_key(self) -> Optional[str]:
@@ -168,6 +179,7 @@ class Contract(str, Enum):
             Contract.FERMI: FERMI_SWAPPER,
             Contract.KIPSELI: KIPSELI_POOL,
             Contract.BEBOP: BEBOP,
+            Contract.METRIC: METRIC_ORACLE,
         }[self]
 
 
@@ -382,6 +394,20 @@ def cd_kipseli_swap(
     )
 
 
+def cd_metric_swap(
+    token_in: str, token_out: str, amount_in: int, min_amount_out: int,
+    recipient: str, deadline: int
+) -> bytes:
+    return encode_call(
+        SEL_LAMBDA_SWAP_VIA_VENUE,
+        [
+            "address", "address", "address", "uint256", "uint256", "address",
+            "uint256",
+        ],
+        [METRIC, token_in, token_out, amount_in, min_amount_out, recipient, deadline],
+    )
+
+
 def _raw_tx(signed) -> bytes:
     raw = getattr(signed, "raw_transaction", None)
     if raw is None:
@@ -441,7 +467,7 @@ async def send_with_account(
 
 def setup_contracts(contract: Contract) -> Tuple[Contract, ...]:
     if contract is Contract.ALL:
-        return (Contract.FERMI, Contract.BEBOP, Contract.KIPSELI)
+        return (Contract.FERMI, Contract.BEBOP, Contract.KIPSELI, Contract.METRIC)
     return (contract,)
 
 
@@ -606,8 +632,14 @@ async def trade_once(
         calldata = cd_fermi_swap(token_in, token_out, amount_specified, amount_check, me)
     elif args.contract is Contract.BEBOP:
         pending = await w3.eth.get_block("pending")
-        expiry = pending["timestamp"] + BEBOP_EXPIRY_SECS
+        expiry = pending["timestamp"] + SWAP_EXPIRY_SECS
         calldata = cd_bebop_swap(token_in, token_out, amount_in, min_out, expiry, me)
+    elif args.contract is Contract.METRIC:
+        pending = await w3.eth.get_block("pending")
+        deadline = pending["timestamp"] + SWAP_EXPIRY_SECS
+        calldata = cd_metric_swap(
+            token_in, token_out, amount_in, min_out, me, deadline
+        )
     else:
         calldata = cd_kipseli_swap(token_in, amount_in, token_out, min_out)
 
@@ -845,7 +877,7 @@ def parse_args() -> argparse.Namespace:
         "--contract",
         type=_enum_arg(Contract, "contract"),
         default=Contract.FERMI,
-        help="Target pAMM contract (fermi|bebop|kipseli|all).",
+        help="Target pAMM contract (fermi|bebop|kipseli|metric|all).",
     )
     p.add_argument(
         "--notional-usd", type=float, default=1.0,
